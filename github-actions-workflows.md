@@ -18,6 +18,33 @@ GitHub needs the dispatch workflow file on the **default branch** for its **Run 
 
 General standards: explicit `timeout-minutes`; least privilege `permissions`; `concurrency` per branch with `cancel-in-progress: true` for CI, but **repository-wide** with `cancel-in-progress: false` for publishing; report `sw_vers`, `uname -m`, `swift --version` and `xcodebuild -version`. Select a known/tested Xcode version, checking that the path exists on each runner first. Runner image/Xcode versions change; adjust consciously.
 
+## Optional private-repository authentication — include in every workflow
+
+**Required standard step, optional secret:** after **every checkout** in **every job** that may fetch Swift packages, add the authentication step below, **before** `swift test`, `swift build`, `xcodebuild`, or dependency resolution. Include it in Fast CI, Full CI (every matrix/simulator job), and Build Release, even when the app currently has no private dependencies.
+
+~~~yaml
+      - name: Authenticate private GitHub repositories (if configured)
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PRIVATE_REPO_TOKEN" ]]; then
+            echo "PRIVATE_REPO_TOKEN is not configured; skipping private repository authentication."
+            exit 0
+          fi
+          git config --global \
+            url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+~~~
+
+- **Secret present:** Git rewrites HTTPS `github.com` clone/fetch URLs to use the token, so SwiftPM/Xcode can access authorized private GitHub packages.
+- **Secret missing or empty:** the step exits successfully without changing Git authentication. Public dependencies continue normally; a private dependency that actually requires credentials still fails explicitly.
+- Create an Actions **repository secret** named `PRIVATE_REPO_TOKEN` in **the repository that runs the workflow**. For a disposable central CI repository, this means you only need to configure the secret once in that CI repository. Other app repositories can use the same YAML without defining the secret.
+- Use a fine-grained personal access token with **Contents: Read-only**, scoped to the needed private dependency repositories. Restrict its lifetime and scope where practical; `All repositories` is simpler but grants broader access.
+- The rewrite applies to HTTPS URLs beginning with `https://github.com/`; SSH URLs (`git@github.com:...`) are not covered. Never print the token, put it into release artifacts, or commit it to the repository. GitHub-hosted runners discard the job environment after completion.
+
+This step is deliberately a shell guard instead of a step-level `if`; missing Actions secrets evaluate to an empty string. It keeps the same workflow usable with and without the secret.
 ## Preparation for a clean checkout
 
 1. Check in `Package.swift` or an XcodeGen `project.yml`; include reproducible dependency pinning where appropriate. Do not rely on a generated, developer-local `.xcodeproj`.
@@ -48,6 +75,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
+      - name: Authenticate private GitHub repositories (if configured)
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PRIVATE_REPO_TOKEN" ]]; then
+            echo "PRIVATE_REPO_TOKEN is not configured; skipping private repository authentication."
+            exit 0
+          fi
+          git config --global \
+            url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
       - name: Toolchain
         run: |
           uname -m
@@ -91,6 +131,19 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
+      - name: Authenticate private GitHub repositories (if configured)
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PRIVATE_REPO_TOKEN" ]]; then
+            echo "PRIVATE_REPO_TOKEN is not configured; skipping private repository authentication."
+            exit 0
+          fi
+          git config --global \
+            url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
       - name: Run repo-specific tests and macOS demo
         shell: bash
         run: |
@@ -160,6 +213,20 @@ jobs:
         with:
           ref: ${{ github.ref }}
           fetch-depth: 0
+
+      - name: Authenticate private GitHub repositories (if configured)
+        shell: bash
+        env:
+          PRIVATE_REPO_TOKEN: ${{ secrets.PRIVATE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$PRIVATE_REPO_TOKEN" ]]; then
+            echo "PRIVATE_REPO_TOKEN is not configured; skipping private repository authentication."
+            exit 0
+          fi
+          git config --global \
+            url."https://x-access-token:${PRIVATE_REPO_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
 
       - name: Generate Xcode project
         shell: bash
@@ -318,6 +385,7 @@ This template is a starting implementation, **not an assertion** that all apps h
 
 - [ ] Exactly three manual-only workflows (or equivalent app-specific names) visible in GitHub Actions.
 - [ ] Selected branch and commit are logged; no hardcoded checkout of another branch.
+- [ ] Every build/test/release job has the optional `PRIVATE_REPO_TOKEN` step immediately after checkout; it skips safely if the secret is not configured.
 - [ ] Fast CI passes from a clean checkout; Full CI provides genuinely broader supported coverage.
 - [ ] Release platform/configuration selectors produce **only** the requested unsigned archive(s).
 - [ ] iOS archive is a **device** `.xcarchive` (not a simulator build), with correct bundle ID/resources.
