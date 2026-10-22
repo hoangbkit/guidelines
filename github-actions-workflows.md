@@ -27,6 +27,43 @@ General standards: explicit `timeout-minutes`; least privilege `permissions`; `c
 5. CI should not need signing certificates, private keychains, App Store Connect tokens or provisioning profiles. Ensure GitHub Actions is enabled in repo settings.
 6. Cache SwiftPM `SourcePackages` keyed by OS/arch/Xcode/dependency lockfile where beneficial; do not blindly cache multi-GB DerivedData. Keep model/voice cache keys independent and versioned, and validate their contents.
 
+## SwiftPM hangs at “Resolve Package Graph”: check Keychain access
+
+A CI build can finish fetching/checking out package repositories and then stop producing output at `Resolve Package Graph`. The last printed package name does **not** identify the operation that is blocked. Confirm the cause before changing dependencies or XcodeGen target wiring.
+
+In Inkribe's [diagnostic run](https://github.com/bybydev/example/actions/runs/39821481466), a process sample captured this wait during a remote binary-framework request:
+
+~~~text
+Workspace.BinaryArtifactsManager.download
+  -> HTTPClient.execute
+  -> KeychainAuthorizationProvider.authentication
+  -> SecItemCopyMatching
+~~~
+
+`SecurityAgent` was also running. SwiftPM was blocked reading a GitHub credential from macOS Keychain. The generated project had no target-dependency cycle. Binary size, model downloads, and signing were not the observed blocking operation.
+
+**Standard for CI: pass `-packageAuthorizationProvider netrc` to every `xcodebuild` invocation that can resolve packages**, including `build`, `test`, `archive`, `-resolvePackageDependencies`, and `-showBuildSettings`. Toolchain-reporting commands such as `xcodebuild -version` do not need it.
+
+~~~bash
+xcodebuild -project MyApp.xcodeproj -scheme MyApp-iOS \
+  -configuration Debug -sdk iphoneos \
+  -destination 'generic/platform=iOS' \
+  -packageAuthorizationProvider netrc \
+  CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+~~~
+
+This explicitly selects netrc instead of Keychain for package authorization. Public binary releases can download anonymously; keep existing scoped Git authentication for private repositories. If private HTTP artifacts require credentials, provide a temporary `~/.netrc` from CI secrets with mode `600`, remove it afterward, and exclude it from artifacts/logs. `GIT_TERMINAL_PROMPT=0` and `CODE_SIGNING_ALLOWED=NO` do not prevent SwiftPM's own Keychain credential lookup.
+
+**If it still hangs:** capture a process sample while `xcodebuild` is alive, before a bounded step timeout (`build_pid` is its process ID):
+
+~~~bash
+/usr/bin/sample "$build_pid" 5 -file "$RUNNER_TEMP/xcodebuild.sample.txt"
+~~~
+
+Save the sample and actual generated `project.pbxproj`/shared schemes as diagnostics, including after failure. Inspect the waiting stack and generated references; a package-resolution status alone is not a diagnosis. GitHub's downloadable job log may remain unavailable until the job finishes.
+
+References: [Apple's documented authorization-provider flag](https://developer.apple.com/documentation/xcode-release-notes/xcode-16-release-notes), [matching CI hang resolved by selecting netrc](https://forums.swift.org/t/xcodebuild-wants-to-use-confidential-information-stored-in-github-com-in-your-keychain-during-ci-build/86819).
+
 ## Fast CI
 
 One `macos-26` Apple Silicon job; aim to run package tests or build/smoke test the principal app with small fixtures. Avoid model downloads and exhaustive OS matrices.
@@ -200,6 +237,7 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/${APP}-iOS.xcarchive"
           xcodebuild -project "$PROJECT" -scheme "$IOS_SCHEME" \
+            -packageAuthorizationProvider netrc \
             -configuration "$CONFIG" -sdk iphoneos \
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/Derived-iOS" \
@@ -227,6 +265,7 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/${APP}-macOS.xcarchive"
           xcodebuild -project "$PROJECT" -scheme "$MAC_SCHEME" \
+            -packageAuthorizationProvider netrc \
             -configuration "$CONFIG" -sdk macosx \
             -destination 'generic/platform=macOS' \
             -derivedDataPath "$RUNNER_TEMP/Derived-macOS" \
@@ -318,6 +357,7 @@ This template is a starting implementation, **not an assertion** that all apps h
 
 - [ ] Exactly three manual-only workflows (or equivalent app-specific names) visible in GitHub Actions.
 - [ ] Selected branch and commit are logged; no hardcoded checkout of another branch.
+- [ ] Package-resolving `xcodebuild` commands explicitly use `-packageAuthorizationProvider netrc` to avoid interactive Keychain credential reads.
 - [ ] Fast CI passes from a clean checkout; Full CI provides genuinely broader supported coverage.
 - [ ] Release platform/configuration selectors produce **only** the requested unsigned archive(s).
 - [ ] iOS archive is a **device** `.xcarchive` (not a simulator build), with correct bundle ID/resources.
